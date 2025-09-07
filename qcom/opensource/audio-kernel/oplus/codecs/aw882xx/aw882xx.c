@@ -36,6 +36,10 @@
 #include "aw882xx_dsp.h"
 #include "aw882xx_bin_parse.h"
 #include "aw882xx_spin.h"
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+/*Add for smartpa err feedback.*/
+#include <soc/oplus/system/oplus_mm_kevent_fb.h>
+#endif
 
 #define AW882XX_DRIVER_VERSION "Dv1.15.0.2"
 #define AW882XX_I2C_NAME "aw882xx_smartpa"
@@ -384,6 +388,143 @@ static void aw882xx_start_pa(struct aw882xx *aw882xx)
 	}
 
 }
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+/*Add for smartpa err feedback.*/
+#define OPLUS_AUDIO_EVENTID_SMARTPA_ERR    10041
+#define ERROR_INFO_MAX_LEN                 20
+#define AW882XX_STATUS_REG                 0x01
+#define AW882XX_STATUS_NORMAL_VALUE        0x311
+/* 0xCFBB = 1100101110111011b, mask bit0/1/3/4/5/7/8/9/11/14/15 */
+#define AW882XX_STATUS_CHECK_MASK          0xCBBB
+#define AW882XX_CHECK_PA_ERR_FEEDBACK      0x1
+
+struct check_status_err {
+	int bit;
+	uint32_t err_val;
+	char info[ERROR_INFO_MAX_LEN];
+};
+static const struct check_status_err check_err[] = {
+	{0,  0, "PllUnlock"},
+	{1,  1, "OverTemperature"},
+	{3,  1, "BoostOverCurrent"},
+	{4,  0, "UnstableClk"},
+	{5,  1, "NoClock"},
+	{7,  1, "Clipping"},
+	{8,  0, "NotSwitch"},
+	{9,  0, "NoBoost"},
+	{11, 1, "CurrentHigh"},
+	{14, 1, "VbatLow"},
+	{15, 1, "BoostOVP"},
+};
+
+const unsigned char fb_regs_aw88264[] = {0x02, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x12, 0x13, 0x14, 0x60, 0x61};
+const unsigned char fb_regs_aw88265[] = {0x02, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0a, 0x0b, 0x0c, 0x20, 0x21, 0x22, 0x23, 0x60, 0x61};
+
+static int aw882xx_check_status_reg(struct aw882xx *aw882xx)
+{
+	unsigned int reg_val = 0;
+	char fd_buf[MM_KEVENT_MAX_PAYLOAD_SIZE] = {0};
+	char info[MM_KEVENT_MAX_PAYLOAD_SIZE] = {0};
+	int offset = 0;
+	int i = 0;
+	int ret = 0;
+
+	if ((aw882xx->last_fb !=0)  && ktime_before(ktime_get(), ktime_add_ms(aw882xx->last_fb, MM_FB_KEY_RATELIMIT_1MIN))) {
+		return 0;
+	}
+
+	ret = aw882xx_i2c_read(aw882xx, AW882XX_STATUS_REG, &reg_val);
+	if (ret < 0) {
+		offset = strlen(info);
+		scnprintf(info + offset, sizeof(info) - offset - 1, \
+				"AW882xx SPK%u:failed to read regs 0x%x, ret=%d,", \
+				aw882xx->aw_pa->channel + 1, AW882XX_STATUS_REG, ret);
+		aw_dev_info(aw882xx->dev, "i2c read error, ret=%d", ret);
+	} else {
+		aw_dev_info(aw882xx->dev, "read reg[0x%x]=0x%x", AW882XX_STATUS_REG, reg_val);
+		if ((AW882XX_STATUS_NORMAL_VALUE & AW882XX_STATUS_CHECK_MASK) != (reg_val & AW882XX_STATUS_CHECK_MASK)) {
+			offset = strlen(info);
+			scnprintf(info + offset, sizeof(info) - offset - 1, \
+					"AW882xx SPK%u:reg[0x%x]=0x%x,", \
+					aw882xx->aw_pa->channel + 1, AW882XX_STATUS_REG, reg_val);
+			for (i = 0; i < ARRAY_SIZE(check_err); i++) {
+				if (check_err[i].err_val == (1 & (reg_val>>check_err[i].bit))) {
+					offset = strlen(info);
+					scnprintf(info + offset, sizeof(info) - offset - 1, "%s,", check_err[i].info);
+				}
+			}
+
+			offset = strlen(info);
+			scnprintf(info + offset, sizeof(info) - offset - 1, "regs:(");
+			if (aw882xx->aw_pa && (PID_1852_ID == aw882xx->aw_pa->chip_id)) {
+				for (i = 0; i < sizeof(fb_regs_aw88264); i++) {
+					ret = aw882xx_i2c_read(aw882xx, fb_regs_aw88264[i], &reg_val);
+					if (ret < 0) {
+						break;
+					} else {
+						offset = strlen(info);
+						scnprintf(info + offset, sizeof(info) - offset - 1, "%x,", reg_val);
+					}
+				}
+			} else {
+				for (i = 0; i < sizeof(fb_regs_aw88265); i++) {
+					ret = aw882xx_i2c_read(aw882xx, fb_regs_aw88265[i], &reg_val);
+					if (ret < 0) {
+						break;
+					} else {
+						offset = strlen(info);
+						scnprintf(info + offset, sizeof(info) - offset - 1, "%x,", reg_val);
+					}
+				}
+			}
+			offset = strlen(info);
+			scnprintf(info + offset, sizeof(info) - offset - 1, ")");
+		}
+	}
+
+	/* feedback the check error */
+	offset = strlen(info);
+	if ((offset > 0) && (offset < MM_KEVENT_MAX_PAYLOAD_SIZE)) {
+		scnprintf(fd_buf, sizeof(fd_buf) - 1, "payload@@%s", info);
+		mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_SMARTPA_ERR,
+				MM_FB_KEY_RATELIMIT_5MIN, fd_buf);
+		aw882xx->last_fb = ktime_get();
+		aw_dev_info(aw882xx->dev, "fd_buf=%s", fd_buf);
+	}
+
+	return 1;
+}
+
+static int aw882xx_get_check_feedback(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	return 0;
+}
+
+static int aw882xx_set_check_feedback(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	aw_snd_soc_codec_t *codec =
+			aw_componet_codec_ops.kcontrol_codec(kcontrol);
+	struct aw882xx *aw882xx =
+			aw_componet_codec_ops.codec_get_drvdata(codec);
+
+	int need_chk = ucontrol->value.integer.value[0];
+	aw_pr_info("%d", need_chk);
+
+	if (need_chk == AW882XX_CHECK_PA_ERR_FEEDBACK) {
+		aw882xx_check_status_reg(aw882xx);
+	}
+
+	return 0;
+}
+
+static const struct snd_kcontrol_new aw882xx_check_feedback[] = {
+	SOC_SINGLE_EXT("PA_ERR_CHECK_FEEDBACK", SND_SOC_NOPM, 0, 0xff, 0,
+			aw882xx_get_check_feedback, aw882xx_set_check_feedback),
+};
+#endif /*OPLUS_FEATURE_MM_FEEDBACK*/
 
 #ifdef OPLUS_FEATURE_SPEAKER_MUTE
 static int aw882xx_spk_mute_ctrl_get(struct snd_kcontrol *kcontrol,
@@ -1633,6 +1774,12 @@ static void aw882xx_add_codec_controls(struct aw882xx *aw882xx)
 	aw_componet_codec_ops.add_codec_controls(aw882xx->codec,
 				&aw882xx_controls[0], ARRAY_SIZE(aw882xx_controls));
 
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	/*Add for smartpa err feedback.*/
+	aw_componet_codec_ops.add_codec_controls(aw882xx->codec,
+			&aw882xx_check_feedback[0], ARRAY_SIZE(aw882xx_check_feedback));
+#endif
+
 	if (aw882xx->aw_pa->spin_desc.aw_spin_kcontrol_st == AW_SPIN_KCONTROL_ENABLE)
 		aw_componet_codec_ops.add_codec_controls(aw882xx->codec,
 				aw882xx_spin_control, ARRAY_SIZE(aw882xx_spin_control));
@@ -1842,6 +1989,10 @@ static int aw882xx_codec_probe(aw_snd_soc_codec_t *aw_codec)
 	INIT_DELAYED_WORK(&aw882xx->interrupt_work, aw882xx_interrupt_work);
 	INIT_DELAYED_WORK(&aw882xx->dc_work, aw882xx_dc_prot_work);
 	INIT_DELAYED_WORK(&aw882xx->fw_work, aw882xx_request_firmware);
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+/*Add for smartpa err feedback.*/
+	aw882xx->last_fb = 0;
+#endif /* CONFIG_OPLUS_FEATURE_MM_FEEDBACK */
 
 	aw882xx->codec = aw_codec;
 

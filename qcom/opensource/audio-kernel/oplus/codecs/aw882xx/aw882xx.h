@@ -203,6 +203,10 @@ struct aw882xx {
 	struct delayed_work interrupt_work;
 	struct delayed_work dc_work;
 	struct delayed_work fw_work;
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+/*Add for smartpa err feedback.*/
+	ktime_t last_fb;
+#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
 	struct mutex lock;
 };
 

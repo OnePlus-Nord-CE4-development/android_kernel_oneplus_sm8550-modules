@@ -23,6 +23,9 @@
 #include "wcd-mbhc-adc.h"
 #include <asoc/wcd-mbhc-v2.h>
 #include <asoc/pdata.h>
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+#include <soc/oplus/system/oplus_mm_kevent_fb.h>
+#endif
 
 #define WCD_MBHC_ADC_HS_THRESHOLD_MV    1700
 #define WCD_MBHC_ADC_HPH_THRESHOLD_MV   75
@@ -369,7 +372,7 @@ static int wcd_check_cross_conn(struct wcd_mbhc *mbhc)
 
 	#ifndef OPLUS_ARCH_EXTENDS
 	/* Add for log cross conn switch pop noise */
-	if (hphl_adc_res > mbhc->hphl_cross_conn_thr ||
+	if (hphl_adc_res > mbhc->hphl_cross_conn_thr &&
 	    hphr_adc_res > mbhc->hphr_cross_conn_thr) {
 		plug_type = MBHC_PLUG_TYPE_GND_MIC_SWAP;
 		pr_debug("%s: Cross connection identified\n", __func__);
@@ -383,7 +386,7 @@ static int wcd_check_cross_conn(struct wcd_mbhc *mbhc)
 	hphr_cross_conn_thr = (mbhc->hphr_cross_conn_thr * micbias_mv) / WCD_MBHC_ADC_MICBIAS_MV;
 	pr_debug("%s: hphl_cross_conn_thr = %d\n", __func__, hphl_cross_conn_thr);
 	pr_debug("%s: hphr_cross_conn_thr = %d\n", __func__, hphr_cross_conn_thr);
-	if (hphl_adc_res > hphl_cross_conn_thr ||
+	if (hphl_adc_res > hphl_cross_conn_thr &&
 	    hphr_adc_res > hphr_cross_conn_thr) {
 		plug_type = MBHC_PLUG_TYPE_GND_MIC_SWAP;
 		pr_debug("%s: Cross connection identified\n", __func__);
@@ -934,6 +937,11 @@ static void wcd_correct_swch_plug(struct work_struct *work)
 #define pr_debug pr_info
 #endif /* OPLUS_ARCH_EXTENDS */
 
+	#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	int retry = 0;
+	char buf[MM_KEVENT_MAX_PAYLOAD_SIZE] = {0};
+	#endif
+
 	pr_debug("%s: enter\n", __func__);
 
 	mbhc = container_of(work, struct wcd_mbhc, correct_plug_swch);
@@ -1145,6 +1153,10 @@ correct_plug_type:
 		if (mbhc->mbhc_cb->hph_pa_on_status)
 			is_pa_on = mbhc->mbhc_cb->hph_pa_on_status(
 					mbhc->component);
+
+		#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+		retry++;
+		#endif /* OPLUS_FEATURE_MM_FEEDBACK */
 
 		#ifdef OPLUS_ARCH_EXTENDS
 		/* Add for mbhc cross connection */
@@ -1482,6 +1494,15 @@ exit:
 
 	mbhc->mbhc_cb->lock_sleep(mbhc, false);
 
+	#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	if ((plug_type != MBHC_PLUG_TYPE_HEADSET) &&
+	    (plug_type != MBHC_PLUG_TYPE_HEADPHONE) &&
+	    !((plug_type == MBHC_PLUG_TYPE_HIGH_HPH) && (retry == HIGH_HPH_DETECT_RETRY_CNT))) {
+		scnprintf(buf, sizeof(buf) - 1, "func@@%s$$plug_type@@%d$$output_mv@@%d$$retry@@%d",
+				__func__, plug_type, output_mv, retry);
+		upload_mm_fb_kevent_to_atlas_limit(OPLUS_AUDIO_EVENTID_HEADSET_DET, buf, MM_FB_KEY_RATELIMIT_1MIN);
+	}
+	#endif /* OPLUS_FEATURE_MM_FEEDBACK */
 	pr_debug("%s: leave\n", __func__);
 }
 
